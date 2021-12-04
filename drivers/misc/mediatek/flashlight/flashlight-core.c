@@ -84,7 +84,24 @@ static int pt_strict; /* always be zero in C standard */
 
 static int pt_is_low(int pt_low_vol, int pt_low_bat, int pt_over_cur);
 #endif
-
+/*zhengjiang.zhu@prize.Camera.Driver  2018/11/13  add for flashlight node:flashlight_torch*/
+//#define FLASHLIGHT_CHANNEL1_TORCH_DUTY       6
+//#define FLASHLIGHT_CHANNEL2_TORCH_DUTY       0
+#define FLASHLIGHT_TORCH_DUTY       10
+#define FLASHLIGHT_TORCH_TIMEOUT  0
+#define PRIZE_LEVEL_TORCH 3
+static int flashlight_state = 0;
+static int decouple = 1;
+static const unsigned char  prize_torch_level[PRIZE_LEVEL_TORCH] = {
+	0x02, 0x04, 0x06
+};
+/*zhengjiang.zhu@prize.Camera.Driver  2018/11/13  end for flashlight node:flashlight_torch*/
+/*zhengjiang.zhu@prize.Camera.Driver  20210726  add for flashlight node:irtorch*/
+#ifdef CONFIG_MTK_FLASHLIGHT_IR_AW36515
+static int flashlight_irtorch_duty = 6;
+static int flashlight_irstate = 0;
+#endif
+/*zhengjiang.zhu@prize.Camera.Driver  2018/11/13  add for flashlight node:irtorch*/
 /******************************************************************************
  * Weak functions
  *****************************************************************************/
@@ -1927,25 +1944,169 @@ unlock:
 	return ret;
 }
 static DEVICE_ATTR_RW(flashlight_sw_disable);
-#endif
-/******************************************************************************
- * Platform device and driver
- *****************************************************************************/
-static struct class *flashlight_class;
-static struct device *flashlight_device;
-static dev_t flashlight_devno;
-static struct cdev *flashlight_cdev;
+/*zhengjiang.zhu@prize.Camera.Driver  2018/11/13  add for flashlight node:flashlight_torch*/
+/* torch sysfs */
+/*torch format: torch_flag, 1:on 0:off */
+static ssize_t flashlight_torch_show(
+		struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d\n", flashlight_state);
+}
 
-#ifdef OPLUS_PLATFORM_MT6771
-/*weiriqin@camera.driver on 20190616, debug flashlight use mt6370 pmic first time*/
-/*Yijun.Tan@Camera.Driver 20180204 add for resolve flash cts verify fail*/
-/******************************************************************************
- * Flashlight operations
- *****************************************************************************/
-static struct regulator *regVCAMIO;
-static int g_VCAMIOEn = 0;
+static ssize_t flashlight_torch_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct flashlight_dev *fdev,*fdev2;
+	struct flashlight_dev_arg fl_dev_arg;
+	int type, ct, part,part_id;
+	int ret;
+	int torch_duty,torch_flag;
+	flashlight_state = *buf - '0';
+	torch_flag = flashlight_state;
+	torch_duty = FLASHLIGHT_TORCH_DUTY;
+	
+	pr_debug("flashlight_torch_store entry  flashlight_state=%d torch_duty=%d torch_flag=%d  decouple =%d\n",flashlight_state,torch_duty,torch_flag,decouple);
 
-void FlashRegulatorCtrl(int Stage)
+	/* find flashlight device */
+	// led1
+	mutex_lock(&fl_mutex);
+	fdev = flashlight_find_dev_by_index(
+			0,
+			0);
+	mutex_unlock(&fl_mutex);
+	if (!fdev) {
+		pr_info("Find no flashlight fdev device \n");
+		return -EINVAL;
+	}
+
+	/* setup flash dev arguments */
+	//fl_dev_arg.arg = fl_arg.arg;
+	fl_dev_arg.channel = fdev->dev_id.channel;
+	type = fdev->dev_id.type;
+	ct = fdev->dev_id.ct;
+	part = fdev->dev_id.part;
+
+	pr_debug("_flashlight_ioctl fl_dev_arg.arg=%d fl_dev_arg.channel=%d type=%d ct=%d part=%d\n",fl_dev_arg.arg,fl_dev_arg.channel,type,ct,part);
+	if (flashlight_verify_index(type, ct, part)) {
+		pr_err("Failed with error index\n");
+		return -EINVAL;
+	}
+
+	//FLASHLIGHTIOC_X_SET_DRIVER
+	part_id = flashlight_get_part_id(part);
+	pr_debug("flashlight_torch_store part_id=%d\n",part_id);
+	if (fdev->ops) {
+		mutex_lock(&fl_mutex);
+		ret = fdev->ops->flashlight_set_driver(part_id);
+		if (fdev->dev_id.decouple) {
+			fl_dev_arg.arg = FLASHLIGHT_SCENARIO_DECOUPLE;
+			fdev->ops->flashlight_ioctl(
+				FLASH_IOC_SET_SCENARIO,
+				(unsigned long)&fl_dev_arg);
+		}
+		mutex_unlock(&fl_mutex);
+
+		//FLASH_IOC_SET_DUTY
+		//fl_dev_arg.arg = FLASHLIGHT_CHANNEL1_TORCH_DUTY;
+		if(torch_duty > 3) {
+			torch_duty = 3;
+		}
+		fl_dev_arg.arg = prize_torch_level[torch_duty];
+		printk("led1 duty=%d \n",fl_dev_arg.arg);
+		mutex_lock(&fl_mutex);
+		ret = fl_set_level(fdev, fl_dev_arg.arg);
+		mutex_unlock(&fl_mutex);
+
+		//FLASH_IOC_SET_TIME_OUT_TIME_MS
+		fl_dev_arg.arg = FLASHLIGHT_TORCH_TIMEOUT;
+		if (fdev->ops->flashlight_ioctl(FLASH_IOC_SET_TIME_OUT_TIME_MS,
+				(unsigned long)&fl_dev_arg)) {
+			pr_err("Failed to set timeout\n");
+			return -EFAULT;
+		}
+
+		//FLASH_IOC_SET_ONOFF
+		fl_dev_arg.arg = torch_flag;
+		mutex_lock(&fl_mutex);
+		ret = fl_enable(fdev, fl_dev_arg.arg);
+		mutex_unlock(&fl_mutex);
+	} else {
+		pr_err("Failed with no flashlight fdev ops \n");
+		return -EFAULT;
+	}
+	// set led2
+	if(decouple == 0) {
+		mutex_lock(&fl_mutex);
+		fdev2 = flashlight_find_dev_by_index(
+				0,
+				1);
+		mutex_unlock(&fl_mutex);
+		if (!fdev2) {
+			pr_info("Find no flashlight fdev2 device\n");
+			return -EINVAL;
+		}
+
+		/* setup flash dev arguments */
+		//fl_dev_arg.arg = fl_arg.arg;
+		fl_dev_arg.channel = fdev2->dev_id.channel;
+		type = fdev2->dev_id.type;
+		ct = fdev2->dev_id.ct;
+		part = fdev2->dev_id.part;
+
+		pr_debug("_flashlight_ioctl fl_dev_arg.arg=%d fl_dev_arg.channel=%d type=%d ct=%d part=%d\n",fl_dev_arg.arg,fl_dev_arg.channel,type,ct,part);
+		if (flashlight_verify_index(type, ct, part)) {
+			pr_err("Failed with error index\n");
+			return -EINVAL;
+		}
+
+		//FLASHLIGHTIOC_X_SET_DRIVER
+		part_id = flashlight_get_part_id(part);
+		pr_debug("flashlight_torch_store part_id=%d\n",part_id);
+		if (fdev2->ops) {
+			mutex_lock(&fl_mutex);
+			ret = fdev2->ops->flashlight_set_driver(part_id);
+			if (fdev2->dev_id.decouple) {
+				fl_dev_arg.arg = FLASHLIGHT_SCENARIO_DECOUPLE;
+				fdev2->ops->flashlight_ioctl(
+					FLASH_IOC_SET_SCENARIO,
+					(unsigned long)&fl_dev_arg);
+			}
+			mutex_unlock(&fl_mutex);
+
+			//FLASH_IOC_SET_DUTY
+			//fl_dev_arg.arg = FLASHLIGHT_CHANNEL2_TORCH_DUTY;
+			fl_dev_arg.arg = torch_duty;
+			printk("led1 duty=%d \n",fl_dev_arg.arg);
+			mutex_lock(&fl_mutex);
+			ret = fl_set_level(fdev2, fl_dev_arg.arg);
+			mutex_unlock(&fl_mutex);
+
+			//FLASH_IOC_SET_TIME_OUT_TIME_MS
+			fl_dev_arg.arg = FLASHLIGHT_TORCH_TIMEOUT;
+			if (fdev2->ops->flashlight_ioctl(FLASH_IOC_SET_TIME_OUT_TIME_MS,
+					(unsigned long)&fl_dev_arg)) {
+				pr_err("Failed to set timeout\n");
+				return -EFAULT;
+			}
+
+			//FLASH_IOC_SET_ONOFF
+			fl_dev_arg.arg = torch_flag;
+			mutex_lock(&fl_mutex);
+			ret = fl_enable(fdev2, fl_dev_arg.arg);
+			mutex_unlock(&fl_mutex);
+		} else {
+			pr_err("Failed with no flashlight fdev2 ops\n");
+			return -EFAULT;
+		}
+	}
+	return size;
+}
+static DEVICE_ATTR(flashlight_torch, 0644, flashlight_torch_show, flashlight_torch_store);
+/*zhengjiang.zhu@prize.Camera.Driver  2018/11/13 end for flashlight node:flashlight_torch*/
+
+/* prize added by zhuzhengjiang, add irtorch, 20210726-start */
+#ifdef CONFIG_MTK_FLASHLIGHT_IR_AW36515
+static ssize_t flashlight_irtorch_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	pr_debug("FlashRegulatorCtrl stage %d, en %d\n", Stage, g_VCAMIOEn);
 
